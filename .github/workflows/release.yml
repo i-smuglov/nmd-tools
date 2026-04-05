@@ -5,6 +5,10 @@ on:
     tags:
       - "**"
 
+# Default GITHUB_TOKEN is read-only in many repos; packager needs this to create GitHub Releases.
+permissions:
+  contents: write
+
 jobs:
   release:
     runs-on: ubuntu-latest

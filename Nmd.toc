@@ -1,8 +1,8 @@
 ## Interface: 120001
-## Title: Nmd
+## Title: nmd-tools
 ## Notes: Symbol ring; RAID/PARTY/GUILD addon comms (no chat line); any sender
-## Author: Lilflame
-## Version: 1.1
+## Author: Mystfall
+## Version: 1.2
 ## X-Wago-ID: 96ELa8Ng
 ## SavedVariables: NmdDB
 
