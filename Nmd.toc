@@ -2,7 +2,7 @@
 ## Title: Nmd
 ## Notes: Symbol ring; RAID/PARTY/GUILD addon comms (no chat line); any sender
 ## Author: Lilflame
-## Version: 1.0
+## Version: 1.1
 ## X-Wago-ID: 96ELa8Ng
 ## SavedVariables: NmdDB
 
