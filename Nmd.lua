@@ -281,16 +281,14 @@ local function ResetSequence()
     UpdateRing()
 end
 
-local function FormatCombatTime(seconds)
-    local totalSeconds = math.max(0, math.floor(seconds or 0))
-    local minutes = math.floor(totalSeconds / 60)
-    local secs = totalSeconds % 60
-    return string.format("%02d:%02d", minutes, secs)
-end
-
 local function UpdateCombatTimerText()
     if not combatTimerText then return end
-    combatTimerText:SetText(FormatCombatTime(combatTimerElapsed))
+    local untilNext = SecondsUntilNextMemoryWindowStart(combatTimerElapsed)
+    if untilNext ~= nil then
+        combatTimerText:SetText(tostring(math.max(0, math.floor(untilNext))))
+    else
+        combatTimerText:SetText("--")
+    end
 end
 
 local function StartCombatTimer()
@@ -313,6 +311,26 @@ local function CombatTimelineWindowIndexAtElapsed(seconds)
         local startAt = MEMORY_WINDOW_STARTS[i]
         if elapsed >= startAt and elapsed < (startAt + MEMORY_WINDOW_DURATION_SEC) then
             return i
+        end
+    end
+    return nil
+end
+
+-- Seconds until the next memory window begins (pull-relative). Nil if no later window.
+local function SecondsUntilNextMemoryWindowStart(elapsed)
+    local e = math.max(0, elapsed or 0)
+    local starts = MEMORY_WINDOW_STARTS
+    for i = 1, #starts do
+        local startAt = starts[i]
+        local endAt = startAt + MEMORY_WINDOW_DURATION_SEC
+        if e < startAt then
+            return startAt - e
+        end
+        if e < endAt then
+            if starts[i + 1] then
+                return starts[i + 1] - e
+            end
+            return nil
         end
     end
     return nil
@@ -444,7 +462,7 @@ combatTimerText:SetPoint("CENTER", timerDragZone, "CENTER", 0, 0)
 combatTimerText:SetWidth(PANEL_TIMER_W)
 combatTimerText:SetHeight(PANEL_TIMER_H)
 combatTimerText:SetJustifyH("CENTER")
-combatTimerText:SetText("00:00")
+combatTimerText:SetText("--")
 
 local cwBtn
 local ccwBtn
