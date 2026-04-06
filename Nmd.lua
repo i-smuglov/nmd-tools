@@ -1,6 +1,7 @@
 --[[
   Nmd — Symbols fill 5 hex vertices from 30° (CW or CCW toggle); fixed 1shield at top. Round masked ring panel.
-  Hidden addon traffic only: RAID / PARTY / GUILD, payload a single digit "1".."5" (RegisterAddonMessagePrefix + CHAT_MSG_ADDON).
+  Raid: visible line "[Nmd]".."1".."5" via SendChatMessage (RAID, or INSTANCE_CHAT when in an LFG/instance group) and matching CHAT_MSG_* handlers — addon channel is unreliable in encounter.
+  Not in raid: PARTY / GUILD via RegisterAddonMessagePrefix + CHAT_MSG_ADDON (payload "1".."5").
   Separate control panel (always movable): five slot buttons (same SYMBOL_TEXTURES as the ring), Direction (CW/CCW), Reset. Optional /nmd s <1-5>.
   No idle reset; after the 5th icon, display clears after 20s.
 ]]
@@ -50,10 +51,12 @@ local MODE_TEXTURES = {
 -- Order matches hex fill; index 1..5 is sent on the wire and maps to SYMBOL_TEXTURES keys.
 local INIT_MACRO_TOKENS = { "T", "X", "O", "V", "D" }
 
--- Addon channel (no chat bubble / log spam); prefix max 16 chars.
+-- Addon channel (no chat bubble / log spam); prefix max 16 chars. Used outside raid (party/guild).
 local COMM_PREFIX = "Nmd"
 -- Incoming CHAT_MSG_ADDON distribution (arg3); ignore WHISPER, CHANNEL, etc.
 local COMM_ACCEPT_DISTRIB = { RAID = true, PARTY = true, GUILD = true }
+-- In-raid wire format (visible once in raid chat); matches encounter-safe path vs SendAddonMessage.
+local RAID_SYMBOL_CHAT_PREFIX = "[Nmd]"
 
 local seq = {}
 local fullRingClearTimer = nil
@@ -64,24 +67,19 @@ local combatTimerText = nil
 local combatTimelineActive = false
 local activeInterfaceMode = nil
 local displaySurfaceVisible = false
+local activeVisibilitySignature = nil
+local nmdSettingsRegistered = false
 
 local INTERFACE_MODE_HIDDEN = "hidden"
 local INTERFACE_MODE_TIMER_ONLY = "timer_only"
 local INTERFACE_MODE_MEMORY = "memory"
 
 local MEMORY_WINDOW_DURATION_SEC = 20
-local MEMORY_WINDOW_STARTS = { 10, 80 }
+-- local MEMORY_WINDOW_STARTS = { 10, 80, 150 }
+local MEMORY_WINDOW_STARTS = { 1, 25, 50 }
 local MEMORY_WINDOW_FILL_CLOCKWISE = { true, false, true }
 -- Raid difficulty from GetInstanceInfo(); only Mythic uses alternating memory-window rotation.
 local RAID_DIFFICULTY_MYTHIC = 16
-
-local function IsMythic()
-    local _, instanceType, difficultyID = GetInstanceInfo()
-    if instanceType ~= "raid" then
-        return false
-    end
-    return difficultyID == RAID_DIFFICULTY_MYTHIC
-end
 
 local function EnsureDBDefaults()
     if type(NmdDB) ~= "table" then NmdDB = {} end
@@ -101,6 +99,23 @@ local function EnsureDBDefaults()
     if type(NmdDB.panel.y) ~= "number" then NmdDB.panel.y = -120 end
 
     if NmdDB.fillClockwise == nil then NmdDB.fillClockwise = true end
+
+    -- Control panel (rune buttons + timer): off unless enabled in Esc > Options > AddOns (callers only).
+    if NmdDB.showControlFrame == nil then NmdDB.showControlFrame = false end
+    if NmdDB.debugIsMythic == nil then NmdDB.debugIsMythic = false end
+    if NmdDB.debugComms == nil then NmdDB.debugComms = false end
+end
+
+local function IsMythic()
+    EnsureDBDefaults()
+    if NmdDB.debugIsMythic == true then
+        return true
+    end
+    local _, instanceType, difficultyID = GetInstanceInfo()
+    if instanceType ~= "raid" then
+        return false
+    end
+    return difficultyID == RAID_DIFFICULTY_MYTHIC
 end
 
 -- Addon/slash args can be secret strings (12.x): avoid converting them in bulk; copy byte-by-byte.
@@ -120,9 +135,40 @@ local function SanitizeExternalString(msg)
     return table.concat(parts)
 end
 
+-- CHAT_MSG_RAID / INSTANCE lines: must parse even when issecretvalue(msg) (retail 12.x); byte copy only.
+local function ExternalStringBytes(msg)
+    if type(msg) ~= "string" then return "" end
+    local parts = {}
+    for i = 1, MAX_EXTERNAL_STR_LEN do
+        local ok, b = pcall(string.byte, msg, i)
+        if not ok then return "" end
+        if b == nil then break end
+        parts[#parts + 1] = string.char(b)
+    end
+    return table.concat(parts)
+end
+
 local function SymbolIndexFromString(s)
     if type(s) ~= "string" or s == "" then return nil end
     local n = tonumber(string.match(s, "^%s*([1-5])%s*$"))
+    return n
+end
+
+local function SymbolIndexFromRaidChatLine(s)
+    if type(s) ~= "string" or s == "" then return nil end
+    local cleaned = ExternalStringBytes(s)
+    if cleaned == "" then return nil end
+    local plain = cleaned:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+    local guard = 0
+    while plain:find("|H", 1, true) and guard < 24 do
+        local nextPlain = plain:gsub("|H.-|h(.-)|h", "%1", 1)
+        if nextPlain == plain then
+            break
+        end
+        plain = nextPlain
+        guard = guard + 1
+    end
+    local n = tonumber(string.match(plain, "%[Nmd%]%s*([1-5])"))
     return n
 end
 
@@ -143,26 +189,26 @@ circleMask:SetTexture("Interface/CHARACTERFRAME/TempPortraitAlphaMask", "CLAMPTO
 circleMask:SetAllPoints(circleFill)
 circleFill:AddMaskTexture(circleMask)
 
-local ringContainer = CreateFrame("Frame", nil, displayFrame)
-ringContainer:SetSize(frameSize, frameSize)
-ringContainer:SetPoint("CENTER", displayFrame, "CENTER", 0, 0)
+local NmdRunesFrame = CreateFrame("Frame", "NmdRunesFrame", displayFrame)
+NmdRunesFrame:SetSize(frameSize, frameSize)
+NmdRunesFrame:SetPoint("CENTER", displayFrame, "CENTER", 0, 0)
 
-local topShieldBtn = CreateFrame("Button", nil, ringContainer)
+local topShieldBtn = CreateFrame("Button", nil, NmdRunesFrame)
 topShieldBtn:SetSize(ICON_SIZE, ICON_SIZE)
 topShieldBtn:RegisterForClicks("LeftButtonUp")
 local topShieldTex = topShieldBtn:CreateTexture(nil, "ARTWORK")
 topShieldTex:SetDrawLayer("ARTWORK", -1)
 topShieldTex:SetAllPoints()
 
-local modeCenterTex = ringContainer:CreateTexture(nil, "ARTWORK")
+local modeCenterTex = NmdRunesFrame:CreateTexture(nil, "ARTWORK")
 modeCenterTex:SetSize(ICON_SIZE, ICON_SIZE)
-modeCenterTex:SetPoint("CENTER", ringContainer, "CENTER", 0, 0)
+modeCenterTex:SetPoint("CENTER", NmdRunesFrame, "CENTER", 0, 0)
 
 local iconTextures = {}
 local maxPool = MAX_RING_ICONS
 
 for i = 1, maxPool do
-    local t = ringContainer:CreateTexture(nil, "ARTWORK")
+    local t = NmdRunesFrame:CreateTexture(nil, "ARTWORK")
     t:SetSize(ICON_SIZE, ICON_SIZE)
     t:Hide()
     iconTextures[i] = t
@@ -228,13 +274,13 @@ local function CreateIconButton(parent, size, texturePath)
     return button
 end
 
-local function UpdateTopShield()
+local function UpdateNmdRunesFrameTopShield()
     topShieldTex:SetTexture(TOP_SHIELD_TEXTURE)
     topShieldTex:SetTexCoord(0, 1, 0, 1)
     topShieldBtn:ClearAllPoints()
     local rad = math.pi / 180
     local angle = TOP_MATH_DEG * rad
-    topShieldBtn:SetPoint("CENTER", ringContainer, "CENTER", RING_RADIUS * math.cos(angle), RING_RADIUS * math.sin(angle))
+    topShieldBtn:SetPoint("CENTER", NmdRunesFrame, "CENTER", RING_RADIUS * math.cos(angle), RING_RADIUS * math.sin(angle))
 end
 
 local function SequenceAngleDeg(index, fillClockwise)
@@ -245,9 +291,9 @@ local function SequenceAngleDeg(index, fillClockwise)
 end
 
 local SetRegionVisibility
-local RefreshRingVisibility
+local RefreshNmdRunesFrameVisibility
 
-local function UpdateRing()
+local function UpdateNmdRunesFrame()
     EnsureDBDefaults()
     local fillCw = NmdDB.fillClockwise
     local n = #seq
@@ -265,11 +311,11 @@ local function UpdateRing()
             local x = RING_RADIUS * math.cos(angle)
             local y = RING_RADIUS * math.sin(angle)
             tex:ClearAllPoints()
-            tex:SetPoint("CENTER", ringContainer, "CENTER", x, y)
+            tex:SetPoint("CENTER", NmdRunesFrame, "CENTER", x, y)
         end
     end
-    UpdateTopShield()
-    RefreshRingVisibility()
+    UpdateNmdRunesFrameTopShield()
+    RefreshNmdRunesFrameVisibility()
 end
 
 local function ResetSequence()
@@ -278,7 +324,7 @@ local function ResetSequence()
         fullRingClearTimer = nil
     end
     seq = {}
-    UpdateRing()
+    UpdateNmdRunesFrame()
 end
 
 local function CombatTimelineWindowIndexAtElapsed(seconds)
@@ -368,7 +414,7 @@ local function TryAddSymbol(token)
     end
 
     seq[#seq + 1] = token
-    UpdateRing()
+    UpdateNmdRunesFrame()
 
     if #seq == MAX_RING_ICONS then
         if fullRingClearTimer then
@@ -381,15 +427,51 @@ local function TryAddSymbol(token)
     end
 end
 
+-- When NmdDB.debugComms: chat-only lines (do not call geterrorhandler — BugGrabber treats that as a real error).
+local function DebugComms(line)
+    EnsureDBDefaults()
+    if not NmdDB.debugComms then return end
+    print("[Nmd][comm] " .. tostring(line))
+end
+
 local function SendSymbolAddonMessage(index)
     if type(index) ~= "number" or index < 1 or index > MAX_RING_ICONS then return end
     local payload = tostring(index)
+    DebugComms(string.format(
+        "send begin: payload=%s inRaid=%s inGroup=%s inGuild=%s combat=%s",
+        payload,
+        tostring(IsInRaid()),
+        tostring(IsInGroup()),
+        tostring(IsInGuild()),
+        tostring(UnitAffectingCombat("player"))
+    ))
     if IsInRaid() then
-        C_ChatInfo.SendAddonMessage(COMM_PREFIX, payload, "RAID")
+        local text = RAID_SYMBOL_CHAT_PREFIX .. payload
+        local chatType = "RAID"
+        if LE_PARTY_CATEGORY_INSTANCE and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+            chatType = "INSTANCE_CHAT"
+        end
+        DebugComms(string.format(
+            "send: SendChatMessage %s (textLen=%s)",
+            chatType,
+            tostring(#text)
+        ))
+        SendChatMessage(text, chatType, nil)
+        DebugComms("send: SendChatMessage returned")
     elseif IsInGroup() then
-        C_ChatInfo.SendAddonMessage(COMM_PREFIX, payload, "PARTY")
+        local a, b, c, d = C_ChatInfo.SendAddonMessage(COMM_PREFIX, payload, "PARTY")
+        DebugComms(string.format(
+            "send: SendAddonMessage PARTY returns a=%s b=%s c=%s d=%s",
+            tostring(a), tostring(b), tostring(c), tostring(d)
+        ))
     elseif IsInGuild() then
-        C_ChatInfo.SendAddonMessage(COMM_PREFIX, payload, "GUILD")
+        local a, b, c, d = C_ChatInfo.SendAddonMessage(COMM_PREFIX, payload, "GUILD")
+        DebugComms(string.format(
+            "send: SendAddonMessage GUILD returns a=%s b=%s c=%s d=%s",
+            tostring(a), tostring(b), tostring(c), tostring(d)
+        ))
+    else
+        DebugComms("send: skipped (not raid/group/guild)")
     end
 end
 
@@ -442,7 +524,6 @@ controlFrame:SetBackdrop({
     tileSize = 32,
 })
 controlFrame:SetBackdropColor(0, 0, 0, 0.82)
-controlFrame:EnableMouse(true)
 
 local buttonRowW = 5 * PANEL_SLOT_BTN + 4 * PANEL_GAP
 local rowW = PANEL_TIMER_W + PANEL_GAP + buttonRowW
@@ -452,13 +533,18 @@ local controlH = PANEL_SLOT_BTN + PANEL_PADDING * 2
 local controlTimerOnlyH = PANEL_SLOT_BTN + PANEL_PADDING * 2
 controlFrame:SetSize(controlW, controlH)
 
-local timerDragZone = CreateFrame("Frame", nil, controlFrame)
-timerDragZone:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", PANEL_PADDING, -PANEL_PADDING)
-timerDragZone:SetSize(PANEL_TIMER_W, PANEL_SLOT_BTN)
-timerDragZone:EnableMouse(true)
+-- Single drag hit layer (below buttons/timer anchor) so StartMoving is not registered twice on the same frame.
+local panelDragLayer = CreateFrame("Frame", nil, controlFrame)
+panelDragLayer:SetAllPoints()
+panelDragLayer:EnableMouse(true)
+
+-- Layout anchor for timer text and icon row; mouse disabled so drags use panelDragLayer underneath.
+local timerTextAnchor = CreateFrame("Frame", nil, controlFrame)
+timerTextAnchor:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", PANEL_PADDING, -PANEL_PADDING)
+timerTextAnchor:SetSize(PANEL_TIMER_W, PANEL_SLOT_BTN)
 
 combatTimerText = controlFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-combatTimerText:SetPoint("CENTER", timerDragZone, "CENTER", 0, 0)
+combatTimerText:SetPoint("CENTER", timerTextAnchor, "CENTER", 0, 0)
 combatTimerText:SetWidth(PANEL_TIMER_W)
 combatTimerText:SetHeight(PANEL_TIMER_H)
 combatTimerText:SetJustifyH("CENTER")
@@ -492,16 +578,16 @@ local function SetFillDirection(fillClockwise)
     local normalized = not not fillClockwise
     if NmdDB.fillClockwise == normalized then
         RefreshDirectionControls()
-        UpdateRing()
+        UpdateNmdRunesFrame()
         return
     end
     NmdDB.fillClockwise = normalized
     RefreshDirectionControls()
-    UpdateRing()
+    UpdateNmdRunesFrame()
 end
 
 local buttonRow = CreateFrame("Frame", nil, controlFrame)
-buttonRow:SetPoint("LEFT", timerDragZone, "RIGHT", PANEL_GAP, 0)
+buttonRow:SetPoint("LEFT", timerTextAnchor, "RIGHT", PANEL_GAP, 0)
 buttonRow:SetSize(buttonRowW, PANEL_SLOT_BTN)
 
 local prev = nil
@@ -545,7 +631,7 @@ SetRegionVisibility = function(region, isVisible)
     end
 end
 
-RefreshRingVisibility = function()
+RefreshNmdRunesFrameVisibility = function()
     SetRegionVisibility(circleFill, displaySurfaceVisible)
     SetRegionVisibility(topShieldBtn, displaySurfaceVisible)
     SetRegionVisibility(modeCenterTex, displaySurfaceVisible)
@@ -559,7 +645,10 @@ end
 local function SetDisplayVisibility(isVisible)
     displaySurfaceVisible = not not isVisible
     SetRegionVisibility(displayFrame, displaySurfaceVisible)
-    RefreshRingVisibility()
+    RefreshNmdRunesFrameVisibility()
+    if not displaySurfaceVisible then
+        ResetSequence()
+    end
 end
 
 local function SetControlPanelVisibility(showTimer, showControls)
@@ -574,7 +663,8 @@ local function SetControlPanelVisibility(showTimer, showControls)
     end
 
     SetRegionVisibility(controlFrame, showRoot)
-    SetRegionVisibility(timerDragZone, showTimer)
+    SetRegionVisibility(panelDragLayer, showRoot)
+    SetRegionVisibility(timerTextAnchor, showTimer)
     SetRegionVisibility(combatTimerText, showTimer)
     SetRegionVisibility(buttonRow, showControls)
     controlFrame:SetSize(newW, newH)
@@ -590,8 +680,24 @@ end
 
 local function ApplyInterfaceVisibility(mode)
     local normalized = mode or INTERFACE_MODE_HIDDEN
-    if activeInterfaceMode == normalized then return end
+    EnsureDBDefaults()
+    local allowControl = NmdDB.showControlFrame == true
+    local sig = normalized .. ":" .. tostring(allowControl)
+    if activeVisibilitySignature == sig then
+        return
+    end
+    activeVisibilitySignature = sig
     activeInterfaceMode = normalized
+
+    if not allowControl then
+        SetControlPanelVisibility(false, false)
+        if normalized == INTERFACE_MODE_MEMORY then
+            SetDisplayVisibility(true)
+        else
+            SetDisplayVisibility(false)
+        end
+        return
+    end
 
     if normalized == INTERFACE_MODE_MEMORY then
         SetControlPanelVisibility(true, true)
@@ -627,6 +733,80 @@ end
 RefreshDirectionControls()
 ApplyInterfaceVisibility(INTERFACE_MODE_HIDDEN)
 
+local function RegisterNmdSettings()
+    if nmdSettingsRegistered then
+        return
+    end
+    if not Settings or not Settings.RegisterVerticalLayoutCategory then
+        return
+    end
+    nmdSettingsRegistered = true
+    EnsureDBDefaults()
+
+    local category, layout = Settings.RegisterVerticalLayoutCategory("Nomad Raid Tools")
+    if layout and CreateSettingsListSectionHeaderInitializer then
+        layout:AddInitializer(CreateSettingsListSectionHeaderInitializer("Midnight falls", nil, nil))
+    end
+
+    local variable = "Nmd_ShowControlFrame"
+    local setting = Settings.RegisterAddOnSetting(
+        category,
+        variable,
+        "showControlFrame",
+        NmdDB,
+        Settings.VarType.Boolean,
+        "Show ControlFrame",
+        Settings.Default.False
+    )
+    Settings.CreateCheckbox(
+        category,
+        setting,
+        "Shows the movable control panel with rune buttons and the combat timer. Turn on if you will call runes in raid; leave off to hide it and only follow symbols from others."
+    )
+    Settings.SetOnValueChangedCallback(variable, function()
+        activeVisibilitySignature = nil
+        RefreshCombatTimelineVisibility()
+    end)
+
+    local debugMythicVariable = "Nmd_DebugIsMythic"
+    local debugMythicSetting = Settings.RegisterAddOnSetting(
+        category,
+        debugMythicVariable,
+        "debugIsMythic",
+        NmdDB,
+        Settings.VarType.Boolean,
+        "IsMythic [debug]",
+        Settings.Default.False
+    )
+    Settings.CreateCheckbox(
+        category,
+        debugMythicSetting,
+        "Treats the encounter as Mythic for automatic CW/CCW rotation during memory windows, so you can test arrow behavior outside Mythic raid."
+    )
+    Settings.SetOnValueChangedCallback(debugMythicVariable, function()
+        RefreshCombatTimelineVisibility()
+        RefreshDirectionControls()
+    end)
+
+    local debugCommsVariable = "Nmd_DebugComms"
+    local debugCommsSetting = Settings.RegisterAddOnSetting(
+        category,
+        debugCommsVariable,
+        "debugComms",
+        NmdDB,
+        Settings.VarType.Boolean,
+        "Log comms [debug]",
+        Settings.Default.False
+    )
+    Settings.CreateCheckbox(
+        category,
+        debugCommsSetting,
+        "Prints each send/recv on the Nmd wire (raid chat vs addon channel) to chat. Does not use the Lua error handler so BugSack stays clean. Turn off after reproducing; can be chatty."
+    )
+
+    Settings.RegisterAddOnCategory(category)
+end
+
 controlFrame:SetScript("OnUpdate", function(_, elapsed)
     if not combatTimelineActive or not combatStartTime then return end
     combatTimerAccum = combatTimerAccum + elapsed
@@ -639,29 +819,76 @@ end)
 
 local commFrame = CreateFrame("Frame")
 commFrame:RegisterEvent("CHAT_MSG_ADDON")
-commFrame:SetScript("OnEvent", function(_, event, prefix, message, distribution, sender)
-    if event ~= "CHAT_MSG_ADDON" then return end
-    if prefix ~= COMM_PREFIX then return end
-    if type(distribution) ~= "string" or not COMM_ACCEPT_DISTRIB[string.upper(distribution)] then
+commFrame:RegisterEvent("CHAT_MSG_RAID")
+commFrame:RegisterEvent("CHAT_MSG_RAID_LEADER")
+commFrame:RegisterEvent("CHAT_MSG_INSTANCE_CHAT")
+commFrame:RegisterEvent("CHAT_MSG_INSTANCE_CHAT_LEADER")
+commFrame:SetScript("OnEvent", function(_, event, ...)
+    local index, sender
+
+    if event == "CHAT_MSG_ADDON" then
+        local prefix, message, distribution, senderArg = ...
+        if prefix ~= COMM_PREFIX then
+            return
+        end
+        DebugComms(string.format(
+            "recv CHAT_MSG_ADDON Nmd dist=%s sender=%s acceptDist=%s",
+            tostring(distribution),
+            tostring(senderArg),
+            tostring(type(distribution) == "string" and COMM_ACCEPT_DISTRIB[string.upper(distribution)] or false)
+        ))
+        if type(distribution) ~= "string" or not COMM_ACCEPT_DISTRIB[string.upper(distribution)] then
+            DebugComms("recv CHAT_MSG_ADDON ignored (distribution not accepted)")
+            return
+        end
+        local messageClean = SanitizeExternalString(message)
+        index = SymbolIndexFromString(messageClean)
+        sender = senderArg
+        DebugComms(string.format(
+            "recv CHAT_MSG_ADDON parsed index=%s msgCleanLen=%s",
+            tostring(index),
+            tostring(#messageClean)
+        ))
+    elseif event == "CHAT_MSG_RAID"
+        or event == "CHAT_MSG_RAID_LEADER"
+        or event == "CHAT_MSG_INSTANCE_CHAT"
+        or event == "CHAT_MSG_INSTANCE_CHAT_LEADER" then
+        local message, senderArg = ...
+        DebugComms(string.format(
+            "recv %s sender=%s snippet=%s",
+            event,
+            tostring(senderArg),
+            tostring(type(message) == "string" and ExternalStringBytes(message):sub(1, 96) or "")
+        ))
+        index = SymbolIndexFromRaidChatLine(message)
+        sender = senderArg
+        DebugComms("recv raid parsed index=" .. tostring(index))
+    else
         return
     end
-    local messageClean = SanitizeExternalString(message)
-    local index = SymbolIndexFromString(messageClean)
-    if not index then return end
+
+    if not index then
+        DebugComms("recv: ignored (no symbol index)")
+        return
+    end
     local token = INIT_MACRO_TOKENS[index]
-    if not token then return end
+    if not token then
+        DebugComms("recv: ignored (no token for index)")
+        return
+    end
 
     local myName = UnitName("player")
     if sender and Ambiguate(sender, "short") == Ambiguate(myName, "short") then
+        DebugComms("recv: ignored (self)")
         return
     end
 
+    DebugComms("recv: applying symbol for index=" .. tostring(index))
     TryAddSymbol(token)
 end)
 
 AttachDragBehavior(displayFrame, displayFrame, "frame")
-AttachDragBehavior(controlFrame, controlFrame, "panel")
-AttachDragBehavior(timerDragZone, controlFrame, "panel")
+AttachDragBehavior(panelDragLayer, controlFrame, "panel")
 
 local function ApplyFrameSettings()
     EnsureDBDefaults()
@@ -686,8 +913,9 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         local addonName = ...
         if addonName ~= "Nmd" then return end
         C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
+        RegisterNmdSettings()
         ApplyFrameSettings()
-        UpdateRing()
+        UpdateNmdRunesFrame()
         if UnitAffectingCombat("player") then
             ResetSequence()
             combatTimelineActive = true
