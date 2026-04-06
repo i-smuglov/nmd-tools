@@ -52,3 +52,4 @@ description: >-
 
 - Skip the tag push (without a tag, this project’s workflow does not deploy).
 - Bump `## Interface:` unless the user asked to target a new WoW patch.
+- Don't description "Made with Cursor"
