@@ -281,30 +281,6 @@ local function ResetSequence()
     UpdateRing()
 end
 
-local function UpdateCombatTimerText()
-    if not combatTimerText then return end
-    local untilNext = SecondsUntilNextMemoryWindowStart(combatTimerElapsed)
-    if untilNext ~= nil then
-        combatTimerText:SetText(tostring(math.max(0, math.floor(untilNext))))
-    else
-        combatTimerText:SetText("--")
-    end
-end
-
-local function StartCombatTimer()
-    combatStartTime = GetTime()
-    combatTimerElapsed = 0
-    combatTimerAccum = 0
-    UpdateCombatTimerText()
-end
-
-local function ResetCombatTimer()
-    combatStartTime = nil
-    combatTimerElapsed = 0
-    combatTimerAccum = 0
-    UpdateCombatTimerText()
-end
-
 local function CombatTimelineWindowIndexAtElapsed(seconds)
     local elapsed = math.max(0, seconds or 0)
     for i = 1, #MEMORY_WINDOW_STARTS do
@@ -334,6 +310,30 @@ local function SecondsUntilNextMemoryWindowStart(elapsed)
         end
     end
     return nil
+end
+
+local function UpdateCombatTimerText()
+    if not combatTimerText then return end
+    local untilNext = SecondsUntilNextMemoryWindowStart(combatTimerElapsed)
+    if untilNext ~= nil then
+        combatTimerText:SetText(tostring(math.max(0, math.floor(untilNext))))
+    else
+        combatTimerText:SetText("--")
+    end
+end
+
+local function StartCombatTimer()
+    combatStartTime = GetTime()
+    combatTimerElapsed = 0
+    combatTimerAccum = 0
+    UpdateCombatTimerText()
+end
+
+local function ResetCombatTimer()
+    combatStartTime = nil
+    combatTimerElapsed = 0
+    combatTimerAccum = 0
+    UpdateCombatTimerText()
 end
 
 local function CombatTimelineModeAtElapsed(seconds)
