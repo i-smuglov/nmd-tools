@@ -33,7 +33,6 @@ local PANEL_TIMER_W = 52
 
 -- Letter keys = texture paths; index 1..5 maps to INIT_MACRO_TOKENS. Paths: no extension; WoW loads .blp/.tga.
 -- Photoshop: Save a Copy, Targa, 32 bpp, Compression None. Alpha should match the logo (not a separate circle).
--- Run tools/normalize_tga_for_wow.py after export: strips TGA 2.0 footer, 24->32 bpp, fixes many green tints.
 local SYMBOL_TEXTURES = {
     T = "Interface\\AddOns\\Nmd\\Icons\\1T",
     X = "Interface\\AddOns\\Nmd\\Icons\\1X",
