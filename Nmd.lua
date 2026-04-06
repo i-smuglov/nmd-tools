@@ -25,7 +25,6 @@ local PANEL_SLOT_BTN = 40
 local PANEL_MODE_BTN = 40
 local PANEL_GAP = 5
 local PANEL_PADDING = 5
-local PANEL_DRAG_H = 5
 local PANEL_BTN_BORDER = 1
 local PANEL_BTN_PADDING = 5
 local PANEL_TIMER_H = 18
@@ -76,7 +75,7 @@ local MEMORY_WINDOW_FILL_CLOCKWISE = { true, false, true }
 -- Raid difficulty from GetInstanceInfo(); only Mythic uses alternating memory-window rotation.
 local RAID_DIFFICULTY_MYTHIC = 16
 
-local function UseMythicMemoryRotationPattern()
+local function IsMythic()
     local _, instanceType, difficultyID = GetInstanceInfo()
     if instanceType ~= "raid" then
         return false
@@ -327,7 +326,7 @@ local function CombatTimelineModeAtElapsed(seconds)
 end
 
 local function CombatWindowFillDirection(windowIndex)
-    if not UseMythicMemoryRotationPattern() then
+    if not IsMythic() then
         return true
     end
     local scheduledDirection = MEMORY_WINDOW_FILL_CLOCKWISE[windowIndex]
@@ -431,17 +430,12 @@ local buttonRowW = 5 * PANEL_SLOT_BTN + 4 * PANEL_GAP
 local rowW = PANEL_TIMER_W + PANEL_GAP + buttonRowW
 local controlW = rowW + PANEL_PADDING * 2
 local controlTimerOnlyW = PANEL_TIMER_W + PANEL_PADDING * 2
-local controlH = PANEL_DRAG_H + PANEL_GAP + PANEL_SLOT_BTN + PANEL_PADDING * 2
-local controlTimerOnlyH = PANEL_DRAG_H + PANEL_GAP + PANEL_SLOT_BTN + PANEL_PADDING * 2
+local controlH = PANEL_SLOT_BTN + PANEL_PADDING * 2
+local controlTimerOnlyH = PANEL_SLOT_BTN + PANEL_PADDING * 2
 controlFrame:SetSize(controlW, controlH)
 
-local dragBar = CreateFrame("Frame", nil, controlFrame)
-dragBar:SetHeight(PANEL_DRAG_H)
-dragBar:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", PANEL_PADDING, -PANEL_PADDING)
-dragBar:SetPoint("TOPRIGHT", controlFrame, "TOPRIGHT", -PANEL_PADDING, -PANEL_PADDING)
-
 local timerDragZone = CreateFrame("Frame", nil, controlFrame)
-timerDragZone:SetPoint("TOPLEFT", dragBar, "BOTTOMLEFT", 0, -PANEL_GAP)
+timerDragZone:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", PANEL_PADDING, -PANEL_PADDING)
 timerDragZone:SetSize(PANEL_TIMER_W, PANEL_SLOT_BTN)
 timerDragZone:EnableMouse(true)
 
@@ -552,12 +546,28 @@ end
 
 local function SetControlPanelVisibility(showTimer, showControls)
     local showRoot = showTimer or showControls
+    local newW = showControls and controlW or controlTimerOnlyW
+    local newH = showControls and controlH or controlTimerOnlyH
+    local prevW, prevH = controlFrame:GetWidth(), controlFrame:GetHeight()
+    local sizeChanged = math.abs(prevW - newW) > 0.5 or math.abs(prevH - newH) > 0.5
+    local anchorLeft, anchorBottom
+    if sizeChanged and controlFrame:GetNumPoints() > 0 then
+        anchorLeft, anchorBottom = controlFrame:GetRect()
+    end
+
     SetRegionVisibility(controlFrame, showRoot)
-    SetRegionVisibility(dragBar, showRoot)
     SetRegionVisibility(timerDragZone, showTimer)
     SetRegionVisibility(combatTimerText, showTimer)
     SetRegionVisibility(buttonRow, showControls)
-    controlFrame:SetSize(showControls and controlW or controlTimerOnlyW, showControls and controlH or controlTimerOnlyH)
+    controlFrame:SetSize(newW, newH)
+
+    -- Wider memory layout adds icons to the right; pin bottom-left so the timer does not shift.
+    if sizeChanged and anchorLeft and anchorBottom then
+        local parent = controlFrame:GetParent() or UIParent
+        controlFrame:ClearAllPoints()
+        controlFrame:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", anchorLeft, anchorBottom)
+        SaveFramePosition(controlFrame, "panel")
+    end
 end
 
 local function ApplyInterfaceVisibility(mode)
@@ -645,7 +655,6 @@ local function ApplyFrameSettings()
     controlFrame:ClearAllPoints()
     controlFrame:SetPoint(NmdDB.panel.point, UIParent, NmdDB.panel.relPoint, NmdDB.panel.x, NmdDB.panel.y)
     controlFrame:SetScale(NmdDB.panel.scale)
-    dragBar:EnableMouse(true)
     RefreshDirectionControls()
     RefreshCombatTimelineVisibility()
 end

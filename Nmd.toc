@@ -2,7 +2,7 @@
 ## Title: Nomads Raid Tools
 ## Notes: Symbol ring + control panel; RAID/PARTY/GUILD addon comms (no chat line); any sender
 ## Author: Mystfall
-## Version: 1.6.1
+## Version: 1.7.0
 ## X-Wago-ID: 96ELa8Ng
 ## SavedVariables: NmdDB
 
