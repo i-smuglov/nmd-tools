@@ -28,6 +28,8 @@ local PANEL_PADDING = 5
 local PANEL_DRAG_H = 5
 local PANEL_BTN_BORDER = 1
 local PANEL_BTN_PADDING = 5
+local PANEL_TIMER_H = 18
+local PANEL_TIMER_W = 52
 
 -- Letter keys = texture paths; index 1..5 maps to INIT_MACRO_TOKENS. Paths: no extension; WoW loads .blp/.tga.
 -- Photoshop: Save a Copy, Targa, 32 bpp, Compression None. Alpha should match the logo (not a separate circle).
@@ -57,6 +59,31 @@ local COMM_ACCEPT_DISTRIB = { RAID = true, PARTY = true, GUILD = true }
 
 local seq = {}
 local fullRingClearTimer = nil
+local combatStartTime = nil
+local combatTimerElapsed = 0
+local combatTimerAccum = 0
+local combatTimerText = nil
+local combatTimelineActive = false
+local activeInterfaceMode = nil
+local displaySurfaceVisible = false
+
+local INTERFACE_MODE_HIDDEN = "hidden"
+local INTERFACE_MODE_TIMER_ONLY = "timer_only"
+local INTERFACE_MODE_MEMORY = "memory"
+
+local MEMORY_WINDOW_DURATION_SEC = 20
+local MEMORY_WINDOW_STARTS = { 10, 80 }
+local MEMORY_WINDOW_FILL_CLOCKWISE = { true, false, true }
+-- Raid difficulty from GetInstanceInfo(); only Mythic uses alternating memory-window rotation.
+local RAID_DIFFICULTY_MYTHIC = 16
+
+local function UseMythicMemoryRotationPattern()
+    local _, instanceType, difficultyID = GetInstanceInfo()
+    if instanceType ~= "raid" then
+        return false
+    end
+    return difficultyID == RAID_DIFFICULTY_MYTHIC
+end
 
 local function EnsureDBDefaults()
     if type(NmdDB) ~= "table" then NmdDB = {} end
@@ -210,7 +237,6 @@ local function UpdateTopShield()
     local rad = math.pi / 180
     local angle = TOP_MATH_DEG * rad
     topShieldBtn:SetPoint("CENTER", ringContainer, "CENTER", RING_RADIUS * math.cos(angle), RING_RADIUS * math.sin(angle))
-    topShieldBtn:Show()
 end
 
 local function SequenceAngleDeg(index, fillClockwise)
@@ -220,6 +246,9 @@ local function SequenceAngleDeg(index, fillClockwise)
     return ICON_ANGLE_CCW_START_DEG + (index - 1) * ICON_ANGLE_STEP_DEG
 end
 
+local SetRegionVisibility
+local RefreshRingVisibility
+
 local function UpdateRing()
     EnsureDBDefaults()
     local fillCw = NmdDB.fillClockwise
@@ -227,16 +256,9 @@ local function UpdateRing()
     local rad = math.pi / 180
     modeCenterTex:SetTexture(TexturePathForMode(fillCw))
     modeCenterTex:SetTexCoord(0, 1, 0, 1)
-    if n > 0 then
-        modeCenterTex:Show()
-    else
-        modeCenterTex:Hide()
-    end
     for i = 1, maxPool do
         local tex = iconTextures[i]
-        if i > n then
-            tex:Hide()
-        else
+        if i <= n then
             local token = seq[i]
             tex:SetTexture(TexturePathForToken(token))
             tex:SetTexCoord(0, 1, 0, 1)
@@ -246,20 +268,10 @@ local function UpdateRing()
             local y = RING_RADIUS * math.sin(angle)
             tex:ClearAllPoints()
             tex:SetPoint("CENTER", ringContainer, "CENTER", x, y)
-            tex:Show()
         end
     end
     UpdateTopShield()
-    -- Shield always visible; circle + symbol icons only after first token until sequence clears.
-    local decorAlpha = (#seq > 0) and 1 or 0
-    circleFill:SetAlpha(decorAlpha)
-    topShieldBtn:SetAlpha(1)
-    for j = 1, maxPool do
-        local tj = iconTextures[j]
-        if tj:IsShown() then
-            tj:SetAlpha(decorAlpha)
-        end
-    end
+    RefreshRingVisibility()
 end
 
 local function ResetSequence()
@@ -269,6 +281,61 @@ local function ResetSequence()
     end
     seq = {}
     UpdateRing()
+end
+
+local function FormatCombatTime(seconds)
+    local totalSeconds = math.max(0, math.floor(seconds or 0))
+    local minutes = math.floor(totalSeconds / 60)
+    local secs = totalSeconds % 60
+    return string.format("%02d:%02d", minutes, secs)
+end
+
+local function UpdateCombatTimerText()
+    if not combatTimerText then return end
+    combatTimerText:SetText(FormatCombatTime(combatTimerElapsed))
+end
+
+local function StartCombatTimer()
+    combatStartTime = GetTime()
+    combatTimerElapsed = 0
+    combatTimerAccum = 0
+    UpdateCombatTimerText()
+end
+
+local function ResetCombatTimer()
+    combatStartTime = nil
+    combatTimerElapsed = 0
+    combatTimerAccum = 0
+    UpdateCombatTimerText()
+end
+
+local function CombatTimelineWindowIndexAtElapsed(seconds)
+    local elapsed = math.max(0, seconds or 0)
+    for i = 1, #MEMORY_WINDOW_STARTS do
+        local startAt = MEMORY_WINDOW_STARTS[i]
+        if elapsed >= startAt and elapsed < (startAt + MEMORY_WINDOW_DURATION_SEC) then
+            return i
+        end
+    end
+    return nil
+end
+
+local function CombatTimelineModeAtElapsed(seconds)
+    if CombatTimelineWindowIndexAtElapsed(seconds) then
+        return INTERFACE_MODE_MEMORY
+    end
+    return INTERFACE_MODE_TIMER_ONLY
+end
+
+local function CombatWindowFillDirection(windowIndex)
+    if not UseMythicMemoryRotationPattern() then
+        return true
+    end
+    local scheduledDirection = MEMORY_WINDOW_FILL_CLOCKWISE[windowIndex]
+    if scheduledDirection ~= nil then
+        return scheduledDirection
+    end
+    return (windowIndex % 2) == 1
 end
 
 topShieldBtn:SetScript("OnClick", function()
@@ -361,14 +428,30 @@ controlFrame:SetBackdrop({
 controlFrame:SetBackdropColor(0, 0, 0, 0.82)
 controlFrame:EnableMouse(true)
 
-local rowW = 5 * PANEL_SLOT_BTN + 2 * PANEL_MODE_BTN + 6 * PANEL_GAP
+local buttonRowW = 5 * PANEL_SLOT_BTN + 4 * PANEL_GAP
+local rowW = PANEL_TIMER_W + PANEL_GAP + buttonRowW
+local controlW = rowW + PANEL_PADDING * 2
+local controlTimerOnlyW = PANEL_TIMER_W + PANEL_PADDING * 2
 local controlH = PANEL_DRAG_H + PANEL_GAP + PANEL_SLOT_BTN + PANEL_PADDING * 2
-controlFrame:SetSize(rowW + PANEL_PADDING * 2, controlH)
+local controlTimerOnlyH = PANEL_DRAG_H + PANEL_GAP + PANEL_SLOT_BTN + PANEL_PADDING * 2
+controlFrame:SetSize(controlW, controlH)
 
 local dragBar = CreateFrame("Frame", nil, controlFrame)
 dragBar:SetHeight(PANEL_DRAG_H)
 dragBar:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", PANEL_PADDING, -PANEL_PADDING)
 dragBar:SetPoint("TOPRIGHT", controlFrame, "TOPRIGHT", -PANEL_PADDING, -PANEL_PADDING)
+
+local timerDragZone = CreateFrame("Frame", nil, controlFrame)
+timerDragZone:SetPoint("TOPLEFT", dragBar, "BOTTOMLEFT", 0, -PANEL_GAP)
+timerDragZone:SetSize(PANEL_TIMER_W, PANEL_SLOT_BTN)
+timerDragZone:EnableMouse(true)
+
+combatTimerText = controlFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+combatTimerText:SetPoint("CENTER", timerDragZone, "CENTER", 0, 0)
+combatTimerText:SetWidth(PANEL_TIMER_W)
+combatTimerText:SetHeight(PANEL_TIMER_H)
+combatTimerText:SetJustifyH("CENTER")
+combatTimerText:SetText("00:00")
 
 local cwBtn
 local ccwBtn
@@ -407,8 +490,8 @@ local function SetFillDirection(fillClockwise)
 end
 
 local buttonRow = CreateFrame("Frame", nil, controlFrame)
-buttonRow:SetPoint("TOPLEFT", dragBar, "BOTTOMLEFT", 0, -PANEL_GAP)
-buttonRow:SetSize(rowW, PANEL_SLOT_BTN)
+buttonRow:SetPoint("LEFT", timerDragZone, "RIGHT", PANEL_GAP, 0)
+buttonRow:SetSize(buttonRowW, PANEL_SLOT_BTN)
 
 local prev = nil
 for i = 1, MAX_RING_ICONS do
@@ -425,6 +508,8 @@ for i = 1, MAX_RING_ICONS do
     prev = btn
 end
 
+-- Rotation arrow buttons temporarily hidden from the panel layout.
+--[[
 cwBtn = CreateIconButton(buttonRow, PANEL_MODE_BTN, MODE_TEXTURES.CW)
 cwBtn:SetPoint("LEFT", prev, "RIGHT", PANEL_GAP, 0)
 cwBtn:RegisterForClicks("LeftButtonUp")
@@ -438,8 +523,92 @@ ccwBtn:RegisterForClicks("LeftButtonUp")
 ccwBtn:SetScript("OnClick", function()
     SetFillDirection(false)
 end)
+]]
+
+SetRegionVisibility = function(region, isVisible)
+    if not region then return end
+    if isVisible then
+        region:Show()
+    else
+        region:Hide()
+    end
+end
+
+RefreshRingVisibility = function()
+    SetRegionVisibility(circleFill, displaySurfaceVisible)
+    SetRegionVisibility(topShieldBtn, displaySurfaceVisible)
+    SetRegionVisibility(modeCenterTex, displaySurfaceVisible)
+
+    for i = 1, maxPool do
+        local tex = iconTextures[i]
+        SetRegionVisibility(tex, displaySurfaceVisible and i <= #seq)
+    end
+end
+
+local function SetDisplayVisibility(isVisible)
+    displaySurfaceVisible = not not isVisible
+    SetRegionVisibility(displayFrame, displaySurfaceVisible)
+    RefreshRingVisibility()
+end
+
+local function SetControlPanelVisibility(showTimer, showControls)
+    local showRoot = showTimer or showControls
+    SetRegionVisibility(controlFrame, showRoot)
+    SetRegionVisibility(dragBar, showRoot)
+    SetRegionVisibility(timerDragZone, showTimer)
+    SetRegionVisibility(combatTimerText, showTimer)
+    SetRegionVisibility(buttonRow, showControls)
+    controlFrame:SetSize(showControls and controlW or controlTimerOnlyW, showControls and controlH or controlTimerOnlyH)
+end
+
+local function ApplyInterfaceVisibility(mode)
+    local normalized = mode or INTERFACE_MODE_HIDDEN
+    if activeInterfaceMode == normalized then return end
+    activeInterfaceMode = normalized
+
+    if normalized == INTERFACE_MODE_MEMORY then
+        SetControlPanelVisibility(true, true)
+        SetDisplayVisibility(true)
+        return
+    end
+
+    if normalized == INTERFACE_MODE_TIMER_ONLY then
+        SetControlPanelVisibility(true, false)
+        SetDisplayVisibility(false)
+        return
+    end
+
+    SetControlPanelVisibility(false, false)
+    SetDisplayVisibility(false)
+end
+
+local function RefreshCombatTimelineVisibility()
+    if combatTimelineActive then
+        local memoryWindowIndex = CombatTimelineWindowIndexAtElapsed(combatTimerElapsed)
+        if memoryWindowIndex then
+            local fillClockwise = CombatWindowFillDirection(memoryWindowIndex)
+            if NmdDB.fillClockwise ~= fillClockwise then
+                SetFillDirection(fillClockwise)
+            end
+        end
+        ApplyInterfaceVisibility(CombatTimelineModeAtElapsed(combatTimerElapsed))
+        return
+    end
+    ApplyInterfaceVisibility(INTERFACE_MODE_HIDDEN)
+end
 
 RefreshDirectionControls()
+ApplyInterfaceVisibility(INTERFACE_MODE_HIDDEN)
+
+controlFrame:SetScript("OnUpdate", function(_, elapsed)
+    if not combatTimelineActive or not combatStartTime then return end
+    combatTimerAccum = combatTimerAccum + elapsed
+    if combatTimerAccum < 0.1 then return end
+    combatTimerAccum = 0
+    combatTimerElapsed = GetTime() - combatStartTime
+    UpdateCombatTimerText()
+    RefreshCombatTimelineVisibility()
+end)
 
 local commFrame = CreateFrame("Frame")
 commFrame:RegisterEvent("CHAT_MSG_ADDON")
@@ -464,7 +633,8 @@ commFrame:SetScript("OnEvent", function(_, event, prefix, message, distribution,
 end)
 
 AttachDragBehavior(displayFrame, displayFrame, "frame")
-AttachDragBehavior(dragBar, controlFrame, "panel")
+AttachDragBehavior(controlFrame, controlFrame, "panel")
+AttachDragBehavior(timerDragZone, controlFrame, "panel")
 
 local function ApplyFrameSettings()
     EnsureDBDefaults()
@@ -472,25 +642,52 @@ local function ApplyFrameSettings()
     displayFrame:SetPoint(NmdDB.frame.point, UIParent, NmdDB.frame.relPoint, NmdDB.frame.x, NmdDB.frame.y)
     displayFrame:SetScale(NmdDB.frame.scale)
     displayFrame:EnableMouse(true)
-    displayFrame:Show()
 
     controlFrame:ClearAllPoints()
     controlFrame:SetPoint(NmdDB.panel.point, UIParent, NmdDB.panel.relPoint, NmdDB.panel.x, NmdDB.panel.y)
     controlFrame:SetScale(NmdDB.panel.scale)
     dragBar:EnableMouse(true)
-    controlFrame:Show()
     RefreshDirectionControls()
+    RefreshCombatTimelineVisibility()
 end
 
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
+eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventFrame:SetScript("OnEvent", function(_, event, ...)
-    if event ~= "ADDON_LOADED" then return end
-    local addonName = ...
-    if addonName ~= "Nmd" then return end
-    C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
-    ApplyFrameSettings()
-    UpdateRing()
+    if event == "ADDON_LOADED" then
+        local addonName = ...
+        if addonName ~= "Nmd" then return end
+        C_ChatInfo.RegisterAddonMessagePrefix(COMM_PREFIX)
+        ApplyFrameSettings()
+        UpdateRing()
+        if UnitAffectingCombat("player") then
+            ResetSequence()
+            combatTimelineActive = true
+            StartCombatTimer()
+            RefreshCombatTimelineVisibility()
+        else
+            ResetSequence()
+            combatTimelineActive = false
+            ResetCombatTimer()
+            RefreshCombatTimelineVisibility()
+        end
+        return
+    end
+    if event == "PLAYER_REGEN_DISABLED" then
+        ResetSequence()
+        combatTimelineActive = true
+        StartCombatTimer()
+        RefreshCombatTimelineVisibility()
+        return
+    end
+    if event == "PLAYER_REGEN_ENABLED" then
+        ResetSequence()
+        combatTimelineActive = false
+        ResetCombatTimer()
+        RefreshCombatTimelineVisibility()
+    end
 end)
 
 SLASH_NMD1 = "/nmd"

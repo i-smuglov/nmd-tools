@@ -2,7 +2,7 @@
 ## Title: nmd-tools
 ## Notes: Symbol ring + control panel; RAID/PARTY/GUILD addon comms (no chat line); any sender
 ## Author: Mystfall
-## Version: 1.3
+## Version: 1.4
 ## X-Wago-ID: 96ELa8Ng
 ## SavedVariables: NmdDB
 
