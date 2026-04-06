@@ -1,9 +1,10 @@
 --[[
   Nmd — Symbols fill 5 hex vertices from 30° (CW or CCW toggle); fixed 1shield at top. Round masked ring panel.
+  Mythic from 180s pull time (phase 4): 3 runes in a horizontal line below center (always LTR). With the control panel enabled in settings, the rune row stays visible for the whole phase (including between memory windows). Same 20s clear after the last rune.
   Raid: visible line "[Nmd]".."1".."5" via SendChatMessage (RAID, or INSTANCE_CHAT when in an LFG/instance group) and matching CHAT_MSG_* handlers — addon channel is unreliable in encounter.
   Not in raid: PARTY / GUILD via RegisterAddonMessagePrefix + CHAT_MSG_ADDON (payload "1".."5").
   Separate control panel (always movable): five slot buttons (same SYMBOL_TEXTURES as the ring), Direction (CW/CCW), Reset. Optional /nmd s <1-5>.
-  No idle reset; after the 5th icon, display clears after 20s.
+  No idle reset; after the last icon for the current phase, display clears after 20s.
 ]]
 
 NmdDB = NmdDB or {}
@@ -69,15 +70,19 @@ local activeInterfaceMode = nil
 local displaySurfaceVisible = false
 local activeVisibilitySignature = nil
 local nmdSettingsRegistered = false
+local lastPhase4LineLayout = false
 
 local INTERFACE_MODE_HIDDEN = "hidden"
 local INTERFACE_MODE_TIMER_ONLY = "timer_only"
 local INTERFACE_MODE_MEMORY = "memory"
 
-local MEMORY_WINDOW_DURATION_SEC = 20
--- local MEMORY_WINDOW_STARTS = { 10, 80, 150 }
-local MEMORY_WINDOW_STARTS = { 1, 25, 50 }
-local MEMORY_WINDOW_FILL_CLOCKWISE = { true, false, true }
+local MEMORY_WINDOW_DURATION_SEC = 5
+local MEMORY_WINDOW_STARTS = { 1, 10, 20 }
+-- Mythic phase 4: at/after this pull time, memory uses 3 runes in a line (not on the hex).
+local MYTHIC_PHASE4_ELAPSED_SEC = 30
+local MYTHIC_PHASE4_RING_ICONS = 3
+local LINE_RUNE_SPACING = ICON_SIZE + 10
+local MEMORY_WINDOW_FILL_CLOCKWISE = { true, false, true, false }
 -- Raid difficulty from GetInstanceInfo(); only Mythic uses alternating memory-window rotation.
 local RAID_DIFFICULTY_MYTHIC = 16
 
@@ -116,6 +121,24 @@ local function IsMythic()
         return false
     end
     return difficultyID == RAID_DIFFICULTY_MYTHIC
+end
+
+local function IsMythicPhase4AtElapsed(seconds)
+    if not IsMythic() then
+        return false
+    end
+    return math.max(0, seconds or 0) >= MYTHIC_PHASE4_ELAPSED_SEC
+end
+
+local function EffectiveMaxRingIcons()
+    if IsMythicPhase4AtElapsed(combatTimerElapsed) then
+        return MYTHIC_PHASE4_RING_ICONS
+    end
+    return MAX_RING_ICONS
+end
+
+local function UseLineRuneLayout()
+    return IsMythicPhase4AtElapsed(combatTimerElapsed)
 end
 
 -- Addon/slash args can be secret strings (12.x): avoid converting them in bulk; copy byte-by-byte.
@@ -290,6 +313,15 @@ local function SequenceAngleDeg(index, fillClockwise)
     return ICON_ANGLE_CCW_START_DEG + (index - 1) * ICON_ANGLE_STEP_DEG
 end
 
+-- Phase 4 (Mythic): collinear runes below center; always left-to-right (no CW/CCW flip).
+local function SequenceLineOffsetXY(index, count)
+    local n = count or MYTHIC_PHASE4_RING_ICONS
+    local mid = (n + 1) / 2
+    local x = (index - mid) * LINE_RUNE_SPACING
+    local y = -RING_RADIUS * 0.42
+    return x, y
+end
+
 local SetRegionVisibility
 local RefreshNmdRunesFrameVisibility
 
@@ -306,10 +338,15 @@ local function UpdateNmdRunesFrame()
             local token = seq[i]
             tex:SetTexture(TexturePathForToken(token))
             tex:SetTexCoord(0, 1, 0, 1)
-            local angleDeg = SequenceAngleDeg(i, fillCw)
-            local angle = angleDeg * rad
-            local x = RING_RADIUS * math.cos(angle)
-            local y = RING_RADIUS * math.sin(angle)
+            local x, y
+            if UseLineRuneLayout() then
+                x, y = SequenceLineOffsetXY(i, MYTHIC_PHASE4_RING_ICONS)
+            else
+                local angleDeg = SequenceAngleDeg(i, fillCw)
+                local angle = angleDeg * rad
+                x = RING_RADIUS * math.cos(angle)
+                y = RING_RADIUS * math.sin(angle)
+            end
             tex:ClearAllPoints()
             tex:SetPoint("CENTER", NmdRunesFrame, "CENTER", x, y)
         end
@@ -335,6 +372,12 @@ local function CombatTimelineWindowIndexAtElapsed(seconds)
             return i
         end
     end
+    if IsMythic() then
+        local startAt = MYTHIC_PHASE4_ELAPSED_SEC
+        if elapsed >= startAt and elapsed < (startAt + MEMORY_WINDOW_DURATION_SEC) then
+            return #MEMORY_WINDOW_STARTS + 1
+        end
+    end
     return nil
 end
 
@@ -352,6 +395,19 @@ local function SecondsUntilNextMemoryWindowStart(elapsed)
             if starts[i + 1] then
                 return starts[i + 1] - e
             end
+            if IsMythic() and e < MYTHIC_PHASE4_ELAPSED_SEC then
+                return MYTHIC_PHASE4_ELAPSED_SEC - e
+            end
+            return nil
+        end
+    end
+    if IsMythic() then
+        local p4 = MYTHIC_PHASE4_ELAPSED_SEC
+        local p4End = p4 + MEMORY_WINDOW_DURATION_SEC
+        if e < p4 then
+            return p4 - e
+        end
+        if e < p4End then
             return nil
         end
     end
@@ -393,6 +449,10 @@ local function CombatWindowFillDirection(windowIndex)
     if not IsMythic() then
         return true
     end
+    -- Phase 4 memory window: line order is fixed LTR; do not rotate to CCW here.
+    if windowIndex == #MEMORY_WINDOW_STARTS + 1 then
+        return true
+    end
     local scheduledDirection = MEMORY_WINDOW_FILL_CLOCKWISE[windowIndex]
     if scheduledDirection ~= nil then
         return scheduledDirection
@@ -409,14 +469,15 @@ local function TryAddSymbol(token)
 
     EnsureDBDefaults()
 
-    if #seq >= MAX_RING_ICONS then
+    local cap = EffectiveMaxRingIcons()
+    if #seq >= cap then
         return
     end
 
     seq[#seq + 1] = token
     UpdateNmdRunesFrame()
 
-    if #seq == MAX_RING_ICONS then
+    if #seq == cap then
         if fullRingClearTimer then
             fullRingClearTimer:Cancel()
         end
@@ -435,7 +496,8 @@ local function DebugComms(line)
 end
 
 local function SendSymbolAddonMessage(index)
-    if type(index) ~= "number" or index < 1 or index > MAX_RING_ICONS then return end
+    local cap = EffectiveMaxRingIcons()
+    if type(index) ~= "number" or index < 1 or index > cap then return end
     local payload = tostring(index)
     DebugComms(string.format(
         "send begin: payload=%s inRaid=%s inGroup=%s inGuild=%s combat=%s",
@@ -476,6 +538,10 @@ local function SendSymbolAddonMessage(index)
 end
 
 local function SendSymbolLocalAndBroadcast(index)
+    local cap = EffectiveMaxRingIcons()
+    if type(index) ~= "number" or index < 1 or index > cap then
+        return
+    end
     local token = INIT_MACRO_TOKENS[index]
     if not token then return end
     TryAddSymbol(token)
@@ -683,6 +749,9 @@ local function ApplyInterfaceVisibility(mode)
     EnsureDBDefaults()
     local allowControl = NmdDB.showControlFrame == true
     local sig = normalized .. ":" .. tostring(allowControl)
+    if normalized == INTERFACE_MODE_TIMER_ONLY and allowControl then
+        sig = sig .. ":p4row=" .. tostring(IsMythicPhase4AtElapsed(combatTimerElapsed))
+    end
     if activeVisibilitySignature == sig then
         return
     end
@@ -706,7 +775,7 @@ local function ApplyInterfaceVisibility(mode)
     end
 
     if normalized == INTERFACE_MODE_TIMER_ONLY then
-        SetControlPanelVisibility(true, false)
+        SetControlPanelVisibility(true, IsMythicPhase4AtElapsed(combatTimerElapsed))
         SetDisplayVisibility(false)
         return
     end
@@ -814,6 +883,13 @@ controlFrame:SetScript("OnUpdate", function(_, elapsed)
     combatTimerAccum = 0
     combatTimerElapsed = GetTime() - combatStartTime
     UpdateCombatTimerText()
+    local nowLine = UseLineRuneLayout()
+    if nowLine ~= lastPhase4LineLayout then
+        lastPhase4LineLayout = nowLine
+        if displaySurfaceVisible and #seq > 0 then
+            UpdateNmdRunesFrame()
+        end
+    end
     RefreshCombatTimelineVisibility()
 end)
 
@@ -871,6 +947,10 @@ commFrame:SetScript("OnEvent", function(_, event, ...)
         DebugComms("recv: ignored (no symbol index)")
         return
     end
+    if index > EffectiveMaxRingIcons() then
+        DebugComms("recv: ignored (index above current phase cap)")
+        return
+    end
     local token = INIT_MACRO_TOKENS[index]
     if not token then
         DebugComms("recv: ignored (no token for index)")
@@ -918,11 +998,13 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         UpdateNmdRunesFrame()
         if UnitAffectingCombat("player") then
             ResetSequence()
+            lastPhase4LineLayout = false
             combatTimelineActive = true
             StartCombatTimer()
             RefreshCombatTimelineVisibility()
         else
             ResetSequence()
+            lastPhase4LineLayout = false
             combatTimelineActive = false
             ResetCombatTimer()
             RefreshCombatTimelineVisibility()
@@ -931,6 +1013,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
     end
     if event == "PLAYER_REGEN_DISABLED" then
         ResetSequence()
+        lastPhase4LineLayout = false
         combatTimelineActive = true
         StartCombatTimer()
         RefreshCombatTimelineVisibility()
@@ -940,6 +1023,7 @@ eventFrame:SetScript("OnEvent", function(_, event, ...)
         ResetSequence()
         combatTimelineActive = false
         ResetCombatTimer()
+        lastPhase4LineLayout = false
         RefreshCombatTimelineVisibility()
     end
 end)
