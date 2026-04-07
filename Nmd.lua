@@ -76,8 +76,8 @@ local INTERFACE_MODE_HIDDEN = "hidden"
 local INTERFACE_MODE_TIMER_ONLY = "timer_only"
 local INTERFACE_MODE_MEMORY = "memory"
 
-local MEMORY_WINDOW_DURATION_SEC = 5
-local MEMORY_WINDOW_STARTS = { 1, 10, 20 }
+local MEMORY_WINDOW_DURATION_SEC = 10
+local MEMORY_WINDOW_STARTS = { 10, 30, 60 }
 -- Mythic phase 4: at/after this pull time, memory uses 3 runes in a line (not on the hex).
 local MYTHIC_PHASE4_ELAPSED_SEC = 30
 local MYTHIC_PHASE4_RING_ICONS = 3
